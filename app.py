@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template_string, redirect, url_for, send_from_directory, jsonify, flash
+from flask import Flask, request, render_template, redirect, url_for, send_from_directory, jsonify, flash
 import os
 import pymongo
 from werkzeug.utils import secure_filename
@@ -6,32 +6,31 @@ from werkzeug.utils import secure_filename
 app = Flask(__name__)
 app.secret_key = "supersecretkey"  # Needed for flash messages
 
-# 🔹 Configuration using Environment Variables
+# Configuration
 UPLOAD_FOLDER = "uploads"
-MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = os.getenv("DB_NAME", "wikram_urls")
+MONGO_URI = "mongodb+srv://viga:viga@cluster0.bael7c5.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+DB_NAME = "wikram_urls"
 
-# 🔹 Ensure upload folder exists
+# Ensure upload folder exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# 🔹 MongoDB Connection (Error Handling)
-mongo_enabled = bool(MONGO_URI)
+# MongoDB Connection (Error Handling)
+mongo_enabled = True
 try:
-    client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000) if mongo_enabled else None
-    if client:
-        client.server_info()  # Test connection
-        db = client[DB_NAME]
-        files_collection = db["urls"]
+    client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    client.server_info()  # Test connection
+    db = client[DB_NAME]
+    files_collection = db["urls"]
 except Exception:
     mongo_enabled = False
     db = None
     files_collection = None
 
-# 🔹 Allow all file types
+# Allow all file types
 def allowed_file(filename):
     return True  # No restrictions
 
-# 🔹 Home Page (Upload Form)
+# Home Page (Upload Form)
 @app.route("/", methods=["GET", "POST"])
 def upload_file():
     if request.method == "POST":
@@ -58,143 +57,35 @@ def upload_file():
             flash("File uploaded successfully!", "success")
             return redirect(url_for("list_tasks"))
 
-    return render_template_string(BASE_HTML, mongo_enabled=mongo_enabled)
+    return render_template("upload.html", mongo_enabled=mongo_enabled)
 
-# 🔹 Show All Uploaded Files
+# Show All Uploaded Files
 @app.route("/tasks")
 def list_tasks():
     files = []
     if mongo_enabled:
         files = list(files_collection.find({}, {"_id": 0}))
 
-    return render_template_string(TASKS_HTML, files=files, mongo_enabled=mongo_enabled)
+    return render_template("tasks.html", files=files, mongo_enabled=mongo_enabled)
 
-# 🔹 Download Files
+# Download Files
 @app.route("/download/<filename>")
 def download_file(filename):
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    if os.path.exists(file_path):
-        return send_from_directory(UPLOAD_FOLDER, filename, as_attachment=True)
-    return "File not found", 404
+    return send_from_directory(UPLOAD_FOLDER, filename, as_attachment=True)
 
-# 🔹 Delete Files
+# Delete Files
 @app.route("/delete/<filename>", methods=["POST"])
 def delete_file(filename):
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    
-    if os.path.exists(file_path):
-        os.remove(file_path)
-        if mongo_enabled:
+    if mongo_enabled:
+        file_record = files_collection.find_one({"filename": filename})
+        if file_record:
+            os.remove(file_record["filepath"])
             files_collection.delete_one({"filename": filename})
-        return jsonify({"status": "success", "message": f"{filename} deleted"})
+            return jsonify({"status": "success", "message": f"{filename} deleted"})
     
     return jsonify({"status": "error", "message": "File not found"})
 
-# 🔹 Run App
+# Run App
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=True, host="0.0.0.0", port=port)
-
-# 🔹 HTML Templates Embedded in the Code
-
-BASE_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>File Manager</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            padding: 0;
-            text-align: center;
-        }
-        nav {
-            background-color: #333;
-            padding: 10px;
-        }
-        nav a {
-            color: white;
-            text-decoration: none;
-            margin: 0 15px;
-        }
-        .warning {
-            color: yellow;
-            font-weight: bold;
-        }
-        table {
-            width: 80%;
-            margin: auto;
-            border-collapse: collapse;
-        }
-        th, td {
-            padding: 10px;
-            border: 1px solid black;
-        }
-    </style>
-</head>
-<body>
-    <nav>
-        <a href="/">Upload</a>
-        <a href="/tasks">Uploaded Files</a>
-        {% if not mongo_enabled %}
-            <span class="warning">⚠ MongoDB Not Connected</span>
-        {% endif %}
-    </nav>
-    {% with messages = get_flashed_messages(with_categories=true) %}
-        {% if messages %}
-            <div>
-                {% for category, message in messages %}
-                    <p class="{{ category }}">{{ message }}</p>
-                {% endfor %}
-            </div>
-        {% endif %}
-    {% endwith %}
-    <form action="/" method="POST" enctype="multipart/form-data">
-        <input type="file" name="file" required>
-        <input type="text" name="custom_name" placeholder="Custom Filename (optional)">
-        <button type="submit">Upload</button>
-    </form>
-</body>
-</html>
-"""
-
-TASKS_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Uploaded Files</title>
-    <style>
-        body { font-family: Arial, sans-serif; text-align: center; }
-        table { width: 80%; margin: auto; border-collapse: collapse; }
-        th, td { padding: 10px; border: 1px solid black; }
-        button { background-color: red; color: white; border: none; padding: 5px; cursor: pointer; }
-    </style>
-</head>
-<body>
-    <nav>
-        <a href="/">Upload</a>
-        <a href="/tasks">Uploaded Files</a>
-        {% if not mongo_enabled %}
-            <span class="warning">⚠ MongoDB Not Connected</span>
-        {% endif %}
-    </nav>
-    <h2>Uploaded Files</h2>
-    <table>
-        <tr><th>Filename</th><th>Size (bytes)</th><th>Download</th><th>Delete</th></tr>
-        {% for file in files %}
-        <tr>
-            <td>{{ file.filename }}</td>
-            <td>{{ file.size }}</td>
-            <td><a href="/download/{{ file.filename }}">Download</a></td>
-            <td>
-                <form action="/delete/{{ file.filename }}" method="post">
-                    <button type="submit">Delete</button>
-                </form>
-            </td>
-        </tr>
-        {% endfor %}
-    </table>
-</body>
-</html>
-"""
