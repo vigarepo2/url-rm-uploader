@@ -31,12 +31,26 @@
             padding: 10px;
             border: 1px solid black;
         }
+        .flash-message {
+            margin: 20px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            display: inline-block;
+        }
+        .flash-message.error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .flash-message.success {
+            background-color: #d4edda;
+            color: #155724;
+        }
     </style>
 </head>
 <body>
     <nav>
-        <a href="/">Upload</a>
-        <a href="/tasks">Uploaded Files</a>
+        <a href="{{ url_for('upload_file') }}">Upload</a>
+        <a href="{{ url_for('list_tasks') }}">Uploaded Files</a>
         {% if not mongo_enabled %}
             <span class="warning">⚠ MongoDB Not Connected</span>
         {% endif %}
@@ -45,7 +59,7 @@
         {% if messages %}
             <div>
                 {% for category, message in messages %}
-                    <p class="{{ category }}">{{ message }}</p>
+                    <p class="flash-message {{ category }}">{{ message }}</p>
                 {% endfor %}
             </div>
         {% endif %}
