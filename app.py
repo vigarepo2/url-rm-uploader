@@ -8,19 +8,20 @@ app.secret_key = "supersecretkey"  # Needed for flash messages
 
 # 🔹 Configuration using Environment Variables
 UPLOAD_FOLDER = "uploads"
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://viga:viga@cluster0.bael7c5.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME", "wikram_urls")
 
 # 🔹 Ensure upload folder exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # 🔹 MongoDB Connection (Error Handling)
-mongo_enabled = True
+mongo_enabled = bool(MONGO_URI)
 try:
-    client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    client.server_info()  # Test connection
-    db = client[DB_NAME]
-    files_collection = db["urls"]
+    client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000) if mongo_enabled else None
+    if client:
+        client.server_info()  # Test connection
+        db = client[DB_NAME]
+        files_collection = db["urls"]
 except Exception:
     mongo_enabled = False
     db = None
@@ -71,17 +72,21 @@ def list_tasks():
 # 🔹 Download Files
 @app.route("/download/<filename>")
 def download_file(filename):
-    return send_from_directory(UPLOAD_FOLDER, filename, as_attachment=True)
+    file_path = os.path.join(UPLOAD_FOLDER, filename)
+    if os.path.exists(file_path):
+        return send_from_directory(UPLOAD_FOLDER, filename, as_attachment=True)
+    return "File not found", 404
 
 # 🔹 Delete Files
 @app.route("/delete/<filename>", methods=["POST"])
 def delete_file(filename):
-    if mongo_enabled:
-        file_record = files_collection.find_one({"filename": filename})
-        if file_record:
-            os.remove(file_record["filepath"])
+    file_path = os.path.join(UPLOAD_FOLDER, filename)
+    
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        if mongo_enabled:
             files_collection.delete_one({"filename": filename})
-            return jsonify({"status": "success", "message": f"{filename} deleted"})
+        return jsonify({"status": "success", "message": f"{filename} deleted"})
     
     return jsonify({"status": "error", "message": "File not found"})
 
@@ -145,29 +150,51 @@ BASE_HTML = """
             </div>
         {% endif %}
     {% endwith %}
-    {% block content %}{% endblock %}
+    <form action="/" method="POST" enctype="multipart/form-data">
+        <input type="file" name="file" required>
+        <input type="text" name="custom_name" placeholder="Custom Filename (optional)">
+        <button type="submit">Upload</button>
+    </form>
 </body>
 </html>
 """
 
 TASKS_HTML = """
-{% extends "base.html" %}
-{% block content %}
-<h2>Uploaded Files</h2>
-<table>
-    <tr><th>Filename</th><th>Size (bytes)</th><th>Download</th><th>Delete</th></tr>
-    {% for file in files %}
-    <tr>
-        <td>{{ file.filename }}</td>
-        <td>{{ file.size }}</td>
-        <td><a href="/download/{{ file.filename }}">Download</a></td>
-        <td>
-            <form action="/delete/{{ file.filename }}" method="post">
-                <button type="submit">Delete</button>
-            </form>
-        </td>
-    </tr>
-    {% endfor %}
-</table>
-{% endblock %}
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Uploaded Files</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; }
+        table { width: 80%; margin: auto; border-collapse: collapse; }
+        th, td { padding: 10px; border: 1px solid black; }
+        button { background-color: red; color: white; border: none; padding: 5px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <nav>
+        <a href="/">Upload</a>
+        <a href="/tasks">Uploaded Files</a>
+        {% if not mongo_enabled %}
+            <span class="warning">⚠ MongoDB Not Connected</span>
+        {% endif %}
+    </nav>
+    <h2>Uploaded Files</h2>
+    <table>
+        <tr><th>Filename</th><th>Size (bytes)</th><th>Download</th><th>Delete</th></tr>
+        {% for file in files %}
+        <tr>
+            <td>{{ file.filename }}</td>
+            <td>{{ file.size }}</td>
+            <td><a href="/download/{{ file.filename }}">Download</a></td>
+            <td>
+                <form action="/delete/{{ file.filename }}" method="post">
+                    <button type="submit">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+</body>
+</html>
 """
