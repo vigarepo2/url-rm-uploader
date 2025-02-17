@@ -2,6 +2,7 @@ from flask import Flask, request, render_template, redirect, url_for, send_from_
 import os
 import pymongo
 from werkzeug.utils import secure_filename
+import requests
 
 app = Flask(__name__)
 app.secret_key = "supersecretkey"  # Needed for flash messages
@@ -14,14 +15,15 @@ DB_NAME = "wikram_urls"
 # Ensure upload folder exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# MongoDB Connection (Error Handling)
+# MongoDB Connection
 mongo_enabled = True
 try:
     client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     client.server_info()  # Test connection
     db = client[DB_NAME]
     files_collection = db["urls"]
-except Exception:
+except Exception as e:
+    print(f"MongoDB connection failed: {e}")
     mongo_enabled = False
     db = None
     files_collection = None
@@ -34,30 +36,50 @@ def allowed_file(filename):
 @app.route("/", methods=["GET", "POST"])
 def upload_file():
     if request.method == "POST":
-        if "file" not in request.files:
-            flash("No file part", "error")
-            return redirect(url_for("upload_file"))
-        
-        file = request.files["file"]
-        custom_name = request.form.get("custom_name")
+        # Handle file upload
+        if "file" in request.files:
+            file = request.files["file"]
+            custom_name = request.form.get("custom_name")
 
-        if file.filename == "":
-            flash("No selected file", "error")
-            return redirect(url_for("upload_file"))
+            if file.filename == "":
+                flash("No selected file", "error")
+                return redirect(url_for("upload_file"))
 
-        if file:
-            filename = secure_filename(custom_name) if custom_name else secure_filename(file.filename)
-            filepath = os.path.join(UPLOAD_FOLDER, filename)
-            file.save(filepath)
+            if file:
+                filename = secure_filename(custom_name) if custom_name else secure_filename(file.filename)
+                filepath = os.path.join(UPLOAD_FOLDER, filename)
+                file.save(filepath)
 
-            if mongo_enabled:
-                file_data = {"filename": filename, "filepath": filepath, "size": os.path.getsize(filepath)}
-                files_collection.insert_one(file_data)
+                if mongo_enabled:
+                    file_data = {"filename": filename, "filepath": filepath, "size": os.path.getsize(filepath)}
+                    files_collection.insert_one(file_data)
 
-            flash("File uploaded successfully!", "success")
+                flash("File uploaded successfully!", "success")
+                return redirect(url_for("list_tasks"))
+
+        # Handle DDL upload
+        ddl_url = request.form.get("ddl_url")
+        if ddl_url:
+            try:
+                response = requests.get(ddl_url, stream=True)
+                response.raise_for_status()
+                filename = secure_filename(os.path.basename(ddl_url))
+                filepath = os.path.join(UPLOAD_FOLDER, filename)
+                with open(filepath, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+                if mongo_enabled:
+                    file_data = {"filename": filename, "filepath": filepath, "size": os.path.getsize(filepath)}
+                    files_collection.insert_one(file_data)
+
+                flash("File downloaded successfully!", "success")
+            except Exception as e:
+                flash(f"Failed to download file: {e}", "error")
+
             return redirect(url_for("list_tasks"))
 
-    return render_template("upload.html", mongo_enabled=mongo_enabled)
+    return render_template("index.html", mongo_enabled=mongo_enabled)
 
 # Show All Uploaded Files
 @app.route("/tasks")
