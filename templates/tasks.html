@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Uploaded Files</h2>
+<table>
+    <tr><th>Filename</th><th>Size (bytes)</th><th>Download</th><th>Delete</th></tr>
+    {% for file in files %}
+    <tr>
+        <td>{{ file.filename }}</td>
+        <td>{{ file.size }}</td>
+        <td><a href="/download/{{ file.filename }}">Download</a></td>
+        <td>
+            <form action="/delete/{{ file.filename }}" method="post">
+                <button type="submit">Delete</button>
+            </form>
+        </td>
+    </tr>
+    {% endfor %}
+</table>
+{% endblock %}
