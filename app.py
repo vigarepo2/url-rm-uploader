@@ -1,6 +1,8 @@
 from flask import Flask, request, render_template_string, redirect, url_for, send_from_directory, jsonify, flash
 import os
 import requests
+import psutil
+import shutil
 from werkzeug.utils import secure_filename
 from datetime import datetime
 import threading
@@ -8,6 +10,8 @@ import urllib.parse
 import re
 import hashlib
 import humanize
+import platform
+import time
 
 app = Flask(__name__)
 app.secret_key = "supersecretkey"
@@ -17,9 +21,41 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 downloads_status = {}
 file_mappings = {}
+active_downloads = {}
+
+def get_system_info():
+    disk = psutil.disk_usage('/')
+    memory = psutil.virtual_memory()
+    
+    return {
+        'disk_total': format_size(disk.total),
+        'disk_used': format_size(disk.used),
+        'disk_free': format_size(disk.free),
+        'disk_percent': disk.percent,
+        'memory_total': format_size(memory.total),
+        'memory_used': format_size(memory.used),
+        'memory_free': format_size(memory.free),
+        'memory_percent': memory.percent,
+        'cpu_percent': psutil.cpu_percent(interval=1),
+        'platform': platform.platform(),
+        'python_version': platform.python_version(),
+        'upload_folder_size': format_size(get_directory_size(UPLOAD_FOLDER)),
+        'upload_file_count': len(os.listdir(UPLOAD_FOLDER))
+    }
+
+def get_directory_size(path):
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            total += os.path.getsize(fp)
+    return total
 
 def format_size(size):
     return humanize.naturalsize(size, binary=True)
+
+def format_time(seconds):
+    return humanize.naturaltime(seconds)
 
 def get_file_hash(filepath):
     hash_md5 = hashlib.md5()
@@ -40,23 +76,21 @@ def check_duplicate_file(filepath):
                     return True
     return False
 
-def get_filename_from_url(url, response):
-    try:
-        if 'Content-Disposition' in response.headers:
-            cd = response.headers['Content-Disposition']
-            if 'filename=' in cd:
-                filename = re.findall('filename="?([^"]+)"?', cd)[0]
-                return urllib.parse.unquote(filename)
-        
-        path = urllib.parse.unquote(urllib.parse.urlparse(url).path)
-        if path and '/' in path:
-            return path.split('/')[-1]
-    except:
-        pass
-    return None
+def calculate_download_speed(start_time, downloaded):
+    elapsed_time = time.time() - start_time
+    if elapsed_time > 0:
+        return downloaded / elapsed_time
+    return 0
+
+def estimate_time_remaining(total_size, downloaded, speed):
+    if speed > 0:
+        remaining_bytes = total_size - downloaded
+        return remaining_bytes / speed
+    return 0
 
 def download_file_async(url, save_filename, original_filename):
     try:
+        start_time = time.time()
         response = requests.get(url, stream=True, allow_redirects=True)
         response.raise_for_status()
         
@@ -65,12 +99,21 @@ def download_file_async(url, save_filename, original_filename):
         block_size = 8192
         downloaded = 0
 
+        active_downloads[save_filename] = {
+            'start_time': start_time,
+            'total_size': total_size
+        }
+
         with open(filepath, 'wb') as file:
             for data in response.iter_content(block_size):
                 downloaded += len(data)
                 file.write(data)
+                
                 if total_size:
                     progress = int((downloaded / total_size) * 100)
+                    speed = calculate_download_speed(start_time, downloaded)
+                    eta = estimate_time_remaining(total_size, downloaded, speed)
+                    
                     downloads_status[save_filename] = {
                         'status': 'downloading',
                         'progress': progress,
@@ -78,7 +121,10 @@ def download_file_async(url, save_filename, original_filename):
                         'downloaded': downloaded,
                         'original_name': original_filename,
                         'formatted_size': format_size(total_size),
-                        'formatted_downloaded': format_size(downloaded)
+                        'formatted_downloaded': format_size(downloaded),
+                        'speed': format_size(speed) + '/s',
+                        'eta': format_time(eta) if eta else 'Calculating...',
+                        'start_time': start_time
                     }
 
         if check_duplicate_file(filepath):
@@ -96,14 +142,20 @@ def download_file_async(url, save_filename, original_filename):
                 'downloaded': total_size,
                 'original_name': original_filename,
                 'formatted_size': format_size(total_size),
-                'formatted_downloaded': format_size(total_size)
+                'formatted_downloaded': format_size(total_size),
+                'completion_time': format_time(time.time() - start_time)
             }
+            
+        del active_downloads[save_filename]
+        
     except Exception as e:
         downloads_status[save_filename] = {
             'status': 'failed',
             'error': str(e),
             'original_name': original_filename
         }
+        if save_filename in active_downloads:
+            del active_downloads[save_filename]
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -136,6 +188,21 @@ HTML_TEMPLATE = """
             box-shadow: 0 2px 15px rgba(0,0,0,0.08);
             margin-bottom: 20px;
             overflow: hidden;
+        }
+        
+        .system-info {
+            background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+            color: white;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+        }
+        
+        .system-info-item {
+            padding: 10px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            margin-bottom: 10px;
         }
         
         .progress {
@@ -185,6 +252,12 @@ HTML_TEMPLATE = """
             color: #6c757d;
         }
         
+        .speed-info {
+            font-size: 0.85rem;
+            color: var(--primary-color);
+            font-weight: 500;
+        }
+        
         .btn {
             border-radius: 6px;
             padding: 0.5rem 1rem;
@@ -220,6 +293,10 @@ HTML_TEMPLATE = """
             .btn-sm {
                 padding: 0.2rem 0.4rem;
             }
+            
+            .system-info {
+                padding: 15px;
+            }
         }
     </style>
 </head>
@@ -233,6 +310,45 @@ HTML_TEMPLATE = """
     </nav>
 
     <div class="container">
+        <div class="system-info">
+            <h5 class="mb-3"><i class="fas fa-server me-2"></i>System Information</h5>
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="system-info-item">
+                        <div class="d-flex justify-content-between">
+                            <span>Disk Space:</span>
+                            <span>{{ system_info.disk_used }} / {{ system_info.disk_total }}</span>
+                        </div>
+                        <div class="progress mt-2">
+                            <div class="progress-bar" role="progressbar" 
+                                 style="width: {{ system_info.disk_percent }}%">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="system-info-item">
+                        <div class="d-flex justify-content-between">
+                            <span>Memory:</span>
+                            <span>{{ system_info.memory_used }} / {{ system_info.memory_total }}</span>
+                        </div>
+                        <div class="progress mt-2">
+                            <div class="progress-bar" role="progressbar" 
+                                 style="width: {{ system_info.memory_percent }}%">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="system-info-item">
+                        <div><i class="fas fa-microchip me-2"></i>CPU Usage: {{ system_info.cpu_percent }}%</div>
+                    </div>
+                    <div class="system-info-item">
+                        <div><i class="fas fa-folder me-2"></i>Upload Folder: {{ system_info.upload_folder_size }}</div>
+                        <div><i class="fas fa-file me-2"></i>Files: {{ system_info.upload_file_count }}</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
                 {% for category, message in messages %}
@@ -312,11 +428,23 @@ HTML_TEMPLATE = """
                                 </div>
                                 
                                 <div class="d-flex justify-content-between align-items-center">
-                                    <span class="size-info">
-                                        {% if info.formatted_downloaded %}
-                                            {{ info.formatted_downloaded }} / {{ info.formatted_size }}
+                                    <div>
+                                        <span class="size-info">
+                                            {% if info.formatted_downloaded %}
+                                                {{ info.formatted_downloaded }} / {{ info.formatted_size }}
+                                            {% endif %}
+                                        </span>
+                                        {% if info.status == 'downloading' %}
+                                            <span class="speed-info ms-2">
+                                                {{ info.speed }} • {{ info.eta }}
+                                            </span>
                                         {% endif %}
-                                    </span>
+                                        {% if info.status == 'completed' and info.completion_time %}
+                                            <span class="text-success ms-2">
+                                                <i class="fas fa-check-circle"></i> Completed {{ info.completion_time }}
+                                            </span>
+                                        {% endif %}
+                                    </div>
                                     <span class="badge {% if info.status == 'completed' %}bg-success{% elif info.status == 'failed' %}bg-danger{% else %}bg-primary{% endif %}">
                                         {{ info.status|title }}
                                     </span>
@@ -403,11 +531,17 @@ def index():
                 
         return redirect(url_for("index"))
     
-    return render_template_string(HTML_TEMPLATE, downloads=downloads_status, file_mappings=file_mappings)
+    return render_template_string(HTML_TEMPLATE, 
+                                downloads=downloads_status, 
+                                file_mappings=file_mappings,
+                                system_info=get_system_info())
 
 @app.route("/status")
 def get_status():
-    return jsonify(downloads_status)
+    return jsonify({
+        'downloads': downloads_status,
+        'system_info': get_system_info()
+    })
 
 @app.route("/download/<path:filename>")
 def download_file(filename):
@@ -427,7 +561,6 @@ def rename_file(filename):
         new_path = os.path.join(UPLOAD_FOLDER, secure_filename(new_name))
         os.rename(old_path, new_path)
         
-        # Update status and mappings
         if filename in downloads_status:
             downloads_status[secure_filename(new_name)] = downloads_status.pop(filename)
             downloads_status[secure_filename(new_name)]['original_name'] = new_name
