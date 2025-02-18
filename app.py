@@ -88,6 +88,29 @@ def estimate_time_remaining(total_size, downloaded, speed):
         return remaining_bytes / speed
     return 0
 
+def get_filename_from_url(url, response):
+    try:
+        # Try Content-Disposition header
+        if 'Content-Disposition' in response.headers:
+            cd = response.headers['Content-Disposition']
+            if 'filename=' in cd:
+                filename = re.findall('filename="?([^"]+)"?', cd)[0]
+                return urllib.parse.unquote(filename)
+        
+        # Try URL path
+        path = urllib.parse.unquote(urllib.parse.urlparse(url).path)
+        if path and '/' in path:
+            return path.split('/')[-1]
+        
+        # Try URL query parameters
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        if 'file' in query:
+            return urllib.parse.unquote(query['file'][0])
+            
+    except Exception:
+        pass
+    return None
+
 def download_file_async(url, save_filename, original_filename):
     try:
         start_time = time.time()
