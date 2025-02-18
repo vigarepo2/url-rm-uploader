@@ -2,13 +2,11 @@ FROM python:3.9
 
 WORKDIR /app
 
-# Install requirements
-RUN pip install flask requests werkzeug
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
-COPY app.py .
+COPY . .
 
-# Create temp downloads directory
 RUN mkdir -p temp_downloads
 
 EXPOSE 5000
