@@ -1,32 +1,26 @@
 from flask import Flask, request, render_template_string, redirect, url_for, send_from_directory, jsonify, flash
-import os
-import requests
-import psutil
-import shutil
+import os, threading, time, urllib.parse, re, hashlib, platform, shutil
+import requests, psutil, humanize
 from werkzeug.utils import secure_filename
 from datetime import datetime
-import threading
-import urllib.parse
-import re
-import hashlib
-import humanize
-import platform
-import time
 
 app = Flask(__name__)
 app.secret_key = "supersecretkey"
 
+# Folder for downloads
 UPLOAD_FOLDER = "temp_downloads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-downloads_status = {}
-file_mappings = {}
-active_downloads = {}
+# Global dictionaries for download tracking and file mappings
+downloads_status = {}   # key: save_filename -> info about progress/status
+file_mappings = {}      # custom URL mappings {save_filename: custom_path}
+active_downloads = {}   # track active downloads (threads)
+cancel_flags = {}       # flag to cancel downloads
 
 def get_system_info():
+    """Return current system information."""
     disk = psutil.disk_usage('/')
     memory = psutil.virtual_memory()
-    
     return {
         'disk_total': format_size(disk.total),
         'disk_used': format_size(disk.used),
@@ -45,7 +39,7 @@ def get_system_info():
 
 def get_directory_size(path):
     total = 0
-    for dirpath, dirnames, filenames in os.walk(path):
+    for dirpath, _, filenames in os.walk(path):
         for f in filenames:
             fp = os.path.join(dirpath, f)
             total += os.path.getsize(fp)
@@ -90,23 +84,17 @@ def estimate_time_remaining(total_size, downloaded, speed):
 
 def get_filename_from_url(url, response):
     try:
-        # Try Content-Disposition header
         if 'Content-Disposition' in response.headers:
             cd = response.headers['Content-Disposition']
             if 'filename=' in cd:
                 filename = re.findall('filename="?([^"]+)"?', cd)[0]
                 return urllib.parse.unquote(filename)
-        
-        # Try URL path
         path = urllib.parse.unquote(urllib.parse.urlparse(url).path)
         if path and '/' in path:
             return path.split('/')[-1]
-        
-        # Try URL query parameters
         query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
         if 'file' in query:
             return urllib.parse.unquote(query['file'][0])
-            
     except Exception:
         pass
     return None
@@ -121,22 +109,29 @@ def download_file_async(url, save_filename, original_filename):
         total_size = int(response.headers.get('content-length', 0))
         block_size = 8192
         downloaded = 0
-
-        active_downloads[save_filename] = {
-            'start_time': start_time,
-            'total_size': total_size
-        }
+        active_downloads[save_filename] = {'start_time': start_time, 'total_size': total_size}
 
         with open(filepath, 'wb') as file:
             for data in response.iter_content(block_size):
-                downloaded += len(data)
+                # Check if user requested cancellation during download
+                if cancel_flags.get(save_filename, False):
+                    downloads_status[save_filename] = {
+                        'status': 'cancelled',
+                        'error': 'Download cancelled by user',
+                        'original_name': original_filename
+                    }
+                    file.close()
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                    active_downloads.pop(save_filename, None)
+                    return
                 file.write(data)
-                
+                downloaded += len(data)
+
                 if total_size:
                     progress = int((downloaded / total_size) * 100)
                     speed = calculate_download_speed(start_time, downloaded)
                     eta = estimate_time_remaining(total_size, downloaded, speed)
-                    
                     downloads_status[save_filename] = {
                         'status': 'downloading',
                         'progress': progress,
@@ -150,6 +145,7 @@ def download_file_async(url, save_filename, original_filename):
                         'start_time': start_time
                     }
 
+        # Finished download: check for duplicates
         if check_duplicate_file(filepath):
             os.remove(filepath)
             downloads_status[save_filename] = {
@@ -168,352 +164,458 @@ def download_file_async(url, save_filename, original_filename):
                 'formatted_downloaded': format_size(total_size),
                 'completion_time': format_time(time.time() - start_time)
             }
-            
-        del active_downloads[save_filename]
-        
+        active_downloads.pop(save_filename, None)
     except Exception as e:
         downloads_status[save_filename] = {
             'status': 'failed',
             'error': str(e),
             'original_name': original_filename
         }
-        if save_filename in active_downloads:
-            del active_downloads[save_filename]
+        active_downloads.pop(save_filename, None)
 
+# HTML template with enhancements: dark mode toggle, modals for rename & delete,
+# cancel download button, clear finished button.
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FDL Server</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <style>
-        :root {
-            --primary-color: #1a237e;
-            --secondary-color: #0d47a1;
-        }
-        
-        body { 
-            background-color: #f8f9fa; 
-            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-        }
-        
-        .navbar { 
-            background-color: var(--primary-color) !important;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        
-        .card {
-            border: none;
-            border-radius: 12px;
-            box-shadow: 0 2px 15px rgba(0,0,0,0.08);
-            margin-bottom: 20px;
-            overflow: hidden;
-        }
-        
-        .system-info {
-            background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
-            color: white;
-            padding: 20px;
-            border-radius: 12px;
-            margin-bottom: 20px;
-        }
-        
-        .system-info-item {
-            padding: 10px;
-            border-radius: 8px;
-            background: rgba(255, 255, 255, 0.1);
-            margin-bottom: 10px;
-        }
-        
-        .progress {
-            height: 8px;
-            border-radius: 4px;
-            background-color: #e9ecef;
-        }
-        
-        .progress-bar {
-            background-color: var(--primary-color);
-        }
-        
-        .download-item {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 15px;
-            border: 1px solid #eee;
-            transition: all 0.3s ease;
-        }
-        
-        .download-item:hover {
-            box-shadow: 0 5px 15px rgba(0,0,0,0.05);
-        }
-        
-        .filename {
-            font-size: 0.95rem;
-            font-weight: 500;
-            color: #2c3e50;
-            word-break: break-word;
-            margin-bottom: 10px;
-            display: block;
-        }
-        
-        .custom-url {
-            font-family: monospace;
-            background: #f8f9fa;
-            padding: 8px 12px;
-            border-radius: 6px;
-            font-size: 0.85em;
-            color: #666;
-            word-break: break-all;
-        }
-        
-        .size-info {
-            font-size: 0.85rem;
-            color: #6c757d;
-        }
-        
-        .speed-info {
-            font-size: 0.85rem;
-            color: var(--primary-color);
-            font-weight: 500;
-        }
-        
-        .btn {
-            border-radius: 6px;
-            padding: 0.5rem 1rem;
-        }
-        
-        .btn-sm {
-            padding: 0.25rem 0.5rem;
-        }
-        
-        .btn-primary {
-            background-color: var(--primary-color);
-            border-color: var(--primary-color);
-        }
-        
-        .btn-primary:hover {
-            background-color: var(--secondary-color);
-            border-color: var(--secondary-color);
-        }
-        
-        @media (max-width: 768px) {
-            .download-item {
-                padding: 15px;
-            }
-            
-            .filename {
-                font-size: 0.9rem;
-            }
-            
-            .custom-url {
-                font-size: 0.8em;
-            }
-            
-            .btn-sm {
-                padding: 0.2rem 0.4rem;
-            }
-            
-            .system-info {
-                padding: 15px;
-            }
-        }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FDL Server</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+  <style>
+    :root {
+      --primary-color: #1a237e;
+      --secondary-color: #0d47a1;
+    }
+    body {
+      background-color: #f8f9fa;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      transition: background-color 0.3s, color 0.3s;
+    }
+    .dark-mode {
+      background-color: #121212;
+      color: #e0e0e0;
+    }
+    .dark-mode .card {
+      background-color: #1e1e1e;
+      border: 1px solid #333;
+    }
+    .dark-mode .navbar {
+      background-color: #1a237e;
+    }
+    .dark-mode .system-info {
+      background: linear-gradient(135deg, #1a237e, #0d47a1);
+    }
+    .navbar {
+      background-color: var(--primary-color) !important;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .card {
+      border: none;
+      border-radius: 12px;
+      box-shadow: 0 2px 15px rgba(0,0,0,0.08);
+      margin-bottom: 20px;
+      overflow: hidden;
+    }
+    .system-info {
+      background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+      color: white;
+      padding: 20px;
+      border-radius: 12px;
+      margin-bottom: 20px;
+    }
+    .system-info-item {
+      padding: 10px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.1);
+      margin-bottom: 10px;
+    }
+    .progress {
+      height: 8px;
+      border-radius: 4px;
+      background-color: #e9ecef;
+    }
+    .dark-mode .progress {
+      background-color: #555;
+    }
+    .progress-bar {
+      background-color: var(--primary-color);
+    }
+    .dark-mode .progress-bar {
+      background-color: #2196F3;
+    }
+    .download-item {
+      background: white;
+      padding: 20px;
+      border-radius: 10px;
+      margin-bottom: 15px;
+      border: 1px solid #eee;
+      transition: all 0.3s ease;
+    }
+    .dark-mode .download-item {
+      background: #1e1e1e;
+      border: 1px solid #333;
+    }
+    .download-item:hover {
+      box-shadow: 0 5px 15px rgba(0,0,0,0.05);
+    }
+    .filename {
+      font-size: 0.95rem;
+      font-weight: 500;
+      color: #2c3e50;
+      word-break: break-word;
+      margin-bottom: 10px;
+      display: block;
+    }
+    .dark-mode .filename {
+      color: #e0e0e0;
+    }
+    .custom-url {
+      font-family: monospace;
+      background: #f8f9fa;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 0.85em;
+      color: #666;
+      word-break: break-all;
+    }
+    .dark-mode .custom-url {
+      background: #333;
+      color: #ccc;
+    }
+    .size-info {
+      font-size: 0.85rem;
+      color: #6c757d;
+    }
+    .speed-info {
+      font-size: 0.85rem;
+      color: var(--primary-color);
+      font-weight: 500;
+    }
+    .btn {
+      border-radius: 6px;
+      padding: 0.5rem 1rem;
+    }
+    .btn-sm {
+      padding: 0.25rem 0.5rem;
+    }
+    .btn-primary {
+      background-color: var(--primary-color);
+      border-color: var(--primary-color);
+    }
+    .btn-primary:hover {
+      background-color: var(--secondary-color);
+      border-color: var(--secondary-color);
+    }
+    @media (max-width: 768px) {
+      .download-item { padding: 15px; }
+      .filename { font-size: 0.9rem; }
+      .custom-url { font-size: 0.8em; }
+      .btn-sm { padding: 0.2rem 0.4rem; }
+      .system-info { padding: 15px; }
+    }
+  </style>
 </head>
 <body>
-    <nav class="navbar navbar-dark mb-4">
-        <div class="container">
-            <a class="navbar-brand" href="/">
-                <i class="fas fa-bolt me-2"></i>FDL Server
-            </a>
-        </div>
-    </nav>
-
+  <!-- Navbar with brand and dark mode toggle -->
+  <nav class="navbar navbar-dark mb-4">
     <div class="container">
-        <div class="system-info">
-            <h5 class="mb-3"><i class="fas fa-server me-2"></i>System Information</h5>
-            <div class="row">
-                <div class="col-md-6">
-                    <div class="system-info-item">
-                        <div class="d-flex justify-content-between">
-                            <span>Disk Space:</span>
-                            <span>{{ system_info.disk_used }} / {{ system_info.disk_total }}</span>
-                        </div>
-                        <div class="progress mt-2">
-                            <div class="progress-bar" role="progressbar" 
-                                 style="width: {{ system_info.disk_percent }}%">
-                            </div>
-                        </div>
-                    </div>
-                    <div class="system-info-item">
-                        <div class="d-flex justify-content-between">
-                            <span>Memory:</span>
-                            <span>{{ system_info.memory_used }} / {{ system_info.memory_total }}</span>
-                        </div>
-                        <div class="progress mt-2">
-                            <div class="progress-bar" role="progressbar" 
-                                 style="width: {{ system_info.memory_percent }}%">
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                <div class="col-md-6">
-                    <div class="system-info-item">
-                        <div><i class="fas fa-microchip me-2"></i>CPU Usage: {{ system_info.cpu_percent }}%</div>
-                    </div>
-                    <div class="system-info-item">
-                        <div><i class="fas fa-folder me-2"></i>Upload Folder: {{ system_info.upload_folder_size }}</div>
-                        <div><i class="fas fa-file me-2"></i>Files: {{ system_info.upload_file_count }}</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                    <div class="alert alert-{{ category }} alert-dismissible fade show">
-                        {{ message }}
-                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-                    </div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-
-        <div class="row">
-            <div class="col-12">
-                <div class="card">
-                    <div class="card-header bg-white py-3">
-                        <h5 class="mb-0"><i class="fas fa-download me-2"></i>New Download</h5>
-                    </div>
-                    <div class="card-body">
-                        <form method="post" class="row g-3">
-                            <div class="col-md-8 col-sm-12">
-                                <input type="url" class="form-control" name="url" 
-                                       placeholder="Enter download URL" required>
-                            </div>
-                            <div class="col-md-2 col-sm-6">
-                                <input type="text" class="form-control" name="custom_url" 
-                                       placeholder="Custom URL path">
-                            </div>
-                            <div class="col-md-2 col-sm-6">
-                                <button type="submit" class="btn btn-primary w-100">
-                                    <i class="fas fa-download me-2"></i>Download
-                                </button>
-                            </div>
-                        </form>
-                    </div>
-                </div>
-            </div>
-
-            <div class="col-12">
-                <div class="card">
-                    <div class="card-header bg-white py-3">
-                        <h5 class="mb-0"><i class="fas fa-list me-2"></i>Downloads</h5>
-                    </div>
-                    <div class="card-body" id="downloads-list">
-                        {% for filename, info in downloads.items() %}
-                            <div class="download-item">
-                                <div class="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center mb-3">
-                                    <span class="filename">{{ info.get('original_name', filename) }}</span>
-                                    <div class="mt-2 mt-md-0">
-                                        {% if info.status == 'completed' %}
-                                            <button class="btn btn-sm btn-outline-primary me-1" 
-                                                    onclick="renameFile('{{ filename }}')">
-                                                <i class="fas fa-edit"></i>
-                                            </button>
-                                            <a href="{{ url_for('download_file', filename=filename) }}" 
-                                               class="btn btn-sm btn-success me-1">
-                                                <i class="fas fa-download"></i>
-                                            </a>
-                                            <button class="btn btn-sm btn-danger" 
-                                                    onclick="deleteFile('{{ filename }}')">
-                                                <i class="fas fa-trash"></i>
-                                            </button>
-                                        {% endif %}
-                                    </div>
-                                </div>
-                                
-                                {% if info.status == 'completed' and filename in file_mappings %}
-                                    <div class="custom-url mb-3">
-                                        {{ request.host_url }}download/{{ file_mappings[filename] }}
-                                    </div>
-                                {% endif %}
-                                
-                                <div class="progress mb-2">
-                                    <div class="progress-bar {% if info.status == 'downloading' %}progress-bar-striped progress-bar-animated{% endif %}"
-                                         role="progressbar" 
-                                         style="width: {{ info.progress if info.progress else 0 }}%">
-                                    </div>
-                                </div>
-                                
-                                <div class="d-flex justify-content-between align-items-center">
-                                    <div>
-                                        <span class="size-info">
-                                            {% if info.formatted_downloaded %}
-                                                {{ info.formatted_downloaded }} / {{ info.formatted_size }}
-                                            {% endif %}
-                                        </span>
-                                        {% if info.status == 'downloading' %}
-                                            <span class="speed-info ms-2">
-                                                {{ info.speed }} • {{ info.eta }}
-                                            </span>
-                                        {% endif %}
-                                        {% if info.status == 'completed' and info.completion_time %}
-                                            <span class="text-success ms-2">
-                                                <i class="fas fa-check-circle"></i> Completed {{ info.completion_time }}
-                                            </span>
-                                        {% endif %}
-                                    </div>
-                                    <span class="badge {% if info.status == 'completed' %}bg-success{% elif info.status == 'failed' %}bg-danger{% else %}bg-primary{% endif %}">
-                                        {{ info.status|title }}
-                                    </span>
-                                </div>
-                            </div>
-                        {% endfor %}
-                    </div>
-                </div>
-            </div>
-        </div>
+      <a class="navbar-brand" href="/">
+        <i class="fas fa-bolt me-2"></i>FDL Server
+      </a>
+      <button class="btn btn-outline-light" id="darkModeToggle" onclick="toggleDarkMode()">
+        <i class="fas fa-moon"></i>
+      </button>
     </div>
+  </nav>
+  
+  <div class="container">
+    <!-- System Information Panel -->
+    <div class="system-info">
+      <h5 class="mb-3"><i class="fas fa-server me-2"></i>System Information</h5>
+      <div class="row">
+        <div class="col-md-6">
+          <div class="system-info-item">
+            <div class="d-flex justify-content-between">
+              <span>Disk Space:</span>
+              <span>{{ system_info.disk_used }} / {{ system_info.disk_total }}</span>
+            </div>
+            <div class="progress mt-2">
+              <div class="progress-bar" role="progressbar" style="width: {{ system_info.disk_percent }}%"></div>
+            </div>
+          </div>
+          <div class="system-info-item">
+            <div class="d-flex justify-content-between">
+              <span>Memory:</span>
+              <span>{{ system_info.memory_used }} / {{ system_info.memory_total }}</span>
+            </div>
+            <div class="progress mt-2">
+              <div class="progress-bar" role="progressbar" style="width: {{ system_info.memory_percent }}%"></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="system-info-item">
+            <div><i class="fas fa-microchip me-2"></i>CPU Usage: {{ system_info.cpu_percent }}%</div>
+          </div>
+          <div class="system-info-item">
+            <div><i class="fas fa-folder me-2"></i>Upload Folder: {{ system_info.upload_folder_size }}</div>
+            <div><i class="fas fa-file me-2"></i>Files: {{ system_info.upload_file_count }}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Flash messages -->
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert alert-{{ category }} alert-dismissible fade show">
+            {{ message }}
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+          </div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+    
+    <!-- New Download Form -->
+    <div class="row">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header bg-white py-3">
+            <h5 class="mb-0"><i class="fas fa-download me-2"></i>New Download</h5>
+          </div>
+          <div class="card-body">
+            <form method="post" class="row g-3">
+              <div class="col-md-8 col-sm-12">
+                <input type="url" class="form-control" name="url" placeholder="Enter download URL" required>
+              </div>
+              <div class="col-md-2 col-sm-6">
+                <input type="text" class="form-control" name="custom_url" placeholder="Custom URL path">
+              </div>
+              <div class="col-md-2 col-sm-6">
+                <button type="submit" class="btn btn-primary w-100">
+                  <i class="fas fa-download me-2"></i>Download
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Downloads List -->
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header bg-white py-3">
+            <h5 class="mb-0 d-inline-block"><i class="fas fa-list me-2"></i>Downloads</h5>
+            <button class="btn btn-sm btn-outline-secondary float-end" onclick="clearDownloads()">
+              <i class="fas fa-trash-alt"></i> Clear Finished
+            </button>
+          </div>
+          <div class="card-body" id="downloads-list">
+            {% for filename, info in downloads.items() %}
+              <div class="download-item">
+                <div class="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center mb-3">
+                  <span class="filename">{{ info.get('original_name', filename) }}</span>
+                  <div class="mt-2 mt-md-0">
+                    {% if info.status in ['completed'] %}
+                      <button class="btn btn-sm btn-outline-primary me-1" onclick="openRenameModal('{{ filename }}', '{{ info.get('original_name', filename)|e }}')">
+                        <i class="fas fa-edit"></i>
+                      </button>
+                      <a href="{{ url_for('download_file', filename=filename) }}" class="btn btn-sm btn-success me-1">
+                        <i class="fas fa-download"></i>
+                      </a>
+                      <button class="btn btn-sm btn-danger" onclick="openDeleteModal('{{ filename }}')">
+                        <i class="fas fa-trash"></i>
+                      </button>
+                    {% elif info.status in ['downloading', 'starting'] %}
+                      <button class="btn btn-sm btn-warning me-1" onclick="cancelDownload('{{ filename }}')">
+                        <i class="fas fa-stop"></i> Cancel
+                      </button>
+                    {% endif %}
+                  </div>
+                </div>
+                {% if info.status == 'completed' and filename in file_mappings %}
+                  <div class="custom-url mb-3">
+                    {{ request.host_url }}download/{{ file_mappings[filename] }}
+                  </div>
+                {% endif %}
+                <div class="progress mb-2">
+                  <div class="progress-bar {% if info.status == 'downloading' %}progress-bar-striped progress-bar-animated{% endif %}"
+                       role="progressbar" style="width: {{ info.progress if info.progress else 0 }}%">
+                  </div>
+                </div>
+                <div class="d-flex justify-content-between align-items-center">
+                  <div>
+                    <span class="size-info">
+                      {% if info.formatted_downloaded %}
+                        {{ info.formatted_downloaded }} / {{ info.formatted_size }}
+                      {% endif %}
+                    </span>
+                    {% if info.status == 'downloading' %}
+                      <span class="speed-info ms-2">
+                        {{ info.speed }} &bull; {{ info.eta }}
+                      </span>
+                    {% endif %}
+                    {% if info.status == 'completed' and info.completion_time %}
+                      <span class="text-success ms-2">
+                        <i class="fas fa-check-circle"></i> Completed {{ info.completion_time }}
+                      </span>
+                    {% endif %}
+                  </div>
+                  <span class="badge 
+                    {% if info.status == 'completed' %}bg-success
+                       {% elif info.status == 'failed' %}bg-danger
+                       {% elif info.status == 'cancelled' %}bg-warning
+                       {% elif info.status == 'duplicate' %}bg-secondary
+                       {% else %}bg-primary{% endif %}">
+                    {{ info.status|title }}
+                  </span>
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Rename Modal -->
+  <div class="modal fade" id="renameModal" tabindex="-1" aria-labelledby="renameModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+      <form id="renameForm">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="renameModalLabel">Rename File</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <input type="hidden" id="rename-file-id" name="filename">
+            <div class="mb-3">
+              <label for="new-filename" class="form-label">New Filename:</label>
+              <input type="text" class="form-control" id="new-filename" name="new_name" required>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+            <button type="submit" class="btn btn-primary">Rename</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+  
+  <!-- Delete Confirmation Modal -->
+  <div class="modal fade" id="deleteModal" tabindex="-1" aria-labelledby="deleteModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+      <form id="deleteForm">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="deleteModalLabel">Delete File</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            Are you sure you want to delete this file?
+            <input type="hidden" id="delete-file-id" name="filename">
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+            <button type="submit" class="btn btn-danger">Delete</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+  
+  <!-- jQuery and Bootstrap Bundle with Popper -->
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    // Toggle dark mode
+    function toggleDarkMode() {
+      document.body.classList.toggle("dark-mode");
+      const btn = document.getElementById("darkModeToggle");
+      if(document.body.classList.contains("dark-mode")){
+        btn.innerHTML = '<i class="fas fa-sun"></i>';
+      } else {
+        btn.innerHTML = '<i class="fas fa-moon"></i>';
+      }
+    }
 
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
-    <script>
-        function updateDownloads() {
-            $.get('/status', function(data) {
-                $('#downloads-list').load(location.href + ' #downloads-list>*');
-            });
+    // Update downloads list every second (partial update)
+    function updateDownloads(){
+      $.get('/status', function(data){
+        $('#downloads-list').load(location.href + ' #downloads-list>*');
+      });
+    }
+    setInterval(updateDownloads, 1000);
+
+    // Open rename modal and set current values
+    function openRenameModal(filename, currentName){
+      $('#rename-file-id').val(filename);
+      $('#new-filename').val(currentName);
+      var renameModal = new bootstrap.Modal(document.getElementById('renameModal'));
+      renameModal.show();
+    }
+    $('#renameForm').submit(function(e){
+      e.preventDefault();
+      var filename = $('#rename-file-id').val();
+      var newName = $('#new-filename').val();
+      $.post('/rename/' + filename, { new_name: newName }, function(response){
+        if(response.status === 'success'){
+          location.reload();
+        } else {
+          alert('Error: ' + response.message);
         }
+      });
+    });
 
-        function renameFile(filename) {
-            const newName = prompt("Enter new filename:");
-            if (newName) {
-                $.post('/rename/' + filename, {new_name: newName}, function(response) {
-                    if (response.status === 'success') {
-                        location.reload();
-                    } else {
-                        alert('Error: ' + response.message);
-                    }
-                });
-            }
+    // Open delete modal and set current file id
+    function openDeleteModal(filename){
+      $('#delete-file-id').val(filename);
+      var deleteModal = new bootstrap.Modal(document.getElementById('deleteModal'));
+      deleteModal.show();
+    }
+    $('#deleteForm').submit(function(e){
+      e.preventDefault();
+      var filename = $('#delete-file-id').val();
+      $.post('/delete/' + filename, function(response){
+        if(response.status === 'success'){
+          location.reload();
+        } else {
+          alert('Error: ' + response.message);
         }
+      });
+    });
 
-        function deleteFile(filename) {
-            if (confirm('Are you sure you want to delete this file?')) {
-                $.post('/delete/' + filename, function(response) {
-                    if (response.status === 'success') {
-                        location.reload();
-                    }
-                });
-            }
-        }
+    // Cancel a download
+    function cancelDownload(filename){
+      if(confirm('Are you sure you want to cancel this download?')){
+        $.post('/cancel/' + filename, function(response){
+          if(response.status === 'success'){
+            location.reload();
+          } else {
+            alert('Error: ' + response.message);
+          }
+        });
+      }
+    }
 
-        setInterval(updateDownloads, 1000);
-    </script>
+    // Clear finished downloads from the list
+    function clearDownloads(){
+      if(confirm('Clear finished downloads from list?')){
+        $.post('/clear', function(response){
+          if(response.status === 'success'){
+            location.reload();
+          } else {
+            alert('Error clearing downloads');
+          }
+        });
+      }
+    }
+  </script>
 </body>
 </html>
 """
@@ -523,23 +625,20 @@ def index():
     if request.method == "POST":
         url = request.form.get("url")
         custom_url = request.form.get("custom_url")
-        
         if url:
             try:
                 response = requests.head(url, allow_redirects=True)
                 original_filename = get_filename_from_url(url, response) or f"download_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 save_filename = secure_filename(original_filename)
-                
                 if custom_url:
                     file_mappings[save_filename] = custom_url
-                
+                # Start download in a separate thread.
                 thread = threading.Thread(
                     target=download_file_async,
                     args=(url, save_filename, original_filename)
                 )
                 thread.daemon = True
                 thread.start()
-                
                 downloads_status[save_filename] = {
                     'status': 'starting',
                     'progress': 0,
@@ -548,23 +647,14 @@ def index():
                     'original_name': original_filename
                 }
                 flash("Download started!", "success")
-                
             except Exception as e:
                 flash(f"Error: {str(e)}", "danger")
-                
         return redirect(url_for("index"))
-    
-    return render_template_string(HTML_TEMPLATE, 
-                                downloads=downloads_status, 
-                                file_mappings=file_mappings,
-                                system_info=get_system_info())
+    return render_template_string(HTML_TEMPLATE, downloads=downloads_status, file_mappings=file_mappings, system_info=get_system_info())
 
 @app.route("/status")
 def get_status():
-    return jsonify({
-        'downloads': downloads_status,
-        'system_info': get_system_info()
-    })
+    return jsonify({'downloads': downloads_status, 'system_info': get_system_info()})
 
 @app.route("/download/<path:filename>")
 def download_file(filename):
@@ -578,18 +668,16 @@ def rename_file(filename):
     new_name = request.form.get("new_name")
     if not new_name:
         return jsonify({"status": "error", "message": "No new name provided"})
-    
     try:
         old_path = os.path.join(UPLOAD_FOLDER, filename)
-        new_path = os.path.join(UPLOAD_FOLDER, secure_filename(new_name))
+        new_filename = secure_filename(new_name)
+        new_path = os.path.join(UPLOAD_FOLDER, new_filename)
         os.rename(old_path, new_path)
-        
         if filename in downloads_status:
-            downloads_status[secure_filename(new_name)] = downloads_status.pop(filename)
-            downloads_status[secure_filename(new_name)]['original_name'] = new_name
+            downloads_status[new_filename] = downloads_status.pop(filename)
+            downloads_status[new_filename]['original_name'] = new_name
         if filename in file_mappings:
-            file_mappings[secure_filename(new_name)] = file_mappings.pop(filename)
-            
+            file_mappings[new_filename] = file_mappings.pop(filename)
         return jsonify({"status": "success"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
@@ -600,13 +688,26 @@ def delete_file(filename):
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         if os.path.exists(filepath):
             os.remove(filepath)
-            if filename in downloads_status:
-                del downloads_status[filename]
-            if filename in file_mappings:
-                del file_mappings[filename]
+            downloads_status.pop(filename, None)
+            file_mappings.pop(filename, None)
         return jsonify({"status": "success"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/cancel/<filename>", methods=["POST"])
+def cancel_download(filename):
+    cancel_flags[filename] = True
+    return jsonify({"status": "success"})
+
+@app.route("/clear", methods=["POST"])
+def clear_downloads():
+    cleared = []
+    for filename, info in list(downloads_status.items()):
+        if info.get("status") in ["completed", "failed", "cancelled", "duplicate"]:
+            downloads_status.pop(filename, None)
+            file_mappings.pop(filename, None)
+            cleared.append(filename)
+    return jsonify({"status": "success", "cleared": cleared})
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
