@@ -7,6 +7,7 @@ import threading
 import urllib.parse
 import re
 import hashlib
+import humanize
 
 app = Flask(__name__)
 app.secret_key = "supersecretkey"
@@ -15,7 +16,10 @@ UPLOAD_FOLDER = "temp_downloads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 downloads_status = {}
-file_mappings = {}  # Store custom URL mappings
+file_mappings = {}
+
+def format_size(size):
+    return humanize.naturalsize(size, binary=True)
 
 def get_file_hash(filepath):
     hash_md5 = hashlib.md5()
@@ -38,14 +42,12 @@ def check_duplicate_file(filepath):
 
 def get_filename_from_url(url, response):
     try:
-        # Try Content-Disposition header
         if 'Content-Disposition' in response.headers:
             cd = response.headers['Content-Disposition']
             if 'filename=' in cd:
                 filename = re.findall('filename="?([^"]+)"?', cd)[0]
                 return urllib.parse.unquote(filename)
         
-        # Try URL path
         path = urllib.parse.unquote(urllib.parse.urlparse(url).path)
         if path and '/' in path:
             return path.split('/')[-1]
@@ -74,14 +76,17 @@ def download_file_async(url, save_filename, original_filename):
                         'progress': progress,
                         'size': total_size,
                         'downloaded': downloaded,
-                        'original_name': original_filename
+                        'original_name': original_filename,
+                        'formatted_size': format_size(total_size),
+                        'formatted_downloaded': format_size(downloaded)
                     }
 
         if check_duplicate_file(filepath):
             os.remove(filepath)
             downloads_status[save_filename] = {
                 'status': 'duplicate',
-                'error': 'File already exists'
+                'error': 'File already exists',
+                'original_name': original_filename
             }
         else:
             downloads_status[save_filename] = {
@@ -89,7 +94,9 @@ def download_file_async(url, save_filename, original_filename):
                 'progress': 100,
                 'size': total_size,
                 'downloaded': total_size,
-                'original_name': original_filename
+                'original_name': original_filename,
+                'formatted_size': format_size(total_size),
+                'formatted_downloaded': format_size(total_size)
             }
     except Exception as e:
         downloads_status[save_filename] = {
@@ -108,35 +115,111 @@ HTML_TEMPLATE = """
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
-        body { background-color: #f8f9fa; }
-        .navbar { background-color: #1a237e !important; }
+        :root {
+            --primary-color: #1a237e;
+            --secondary-color: #0d47a1;
+        }
+        
+        body { 
+            background-color: #f8f9fa; 
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+        }
+        
+        .navbar { 
+            background-color: var(--primary-color) !important;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
         .card {
             border: none;
-            border-radius: 10px;
-            box-shadow: 0 2px 15px rgba(0,0,0,0.1);
+            border-radius: 12px;
+            box-shadow: 0 2px 15px rgba(0,0,0,0.08);
             margin-bottom: 20px;
+            overflow: hidden;
         }
+        
         .progress {
             height: 8px;
             border-radius: 4px;
+            background-color: #e9ecef;
         }
+        
+        .progress-bar {
+            background-color: var(--primary-color);
+        }
+        
         .download-item {
             background: white;
-            padding: 15px;
-            border-radius: 8px;
+            padding: 20px;
+            border-radius: 10px;
             margin-bottom: 15px;
             border: 1px solid #eee;
+            transition: all 0.3s ease;
         }
+        
+        .download-item:hover {
+            box-shadow: 0 5px 15px rgba(0,0,0,0.05);
+        }
+        
+        .filename {
+            font-size: 0.95rem;
+            font-weight: 500;
+            color: #2c3e50;
+            word-break: break-word;
+            margin-bottom: 10px;
+            display: block;
+        }
+        
         .custom-url {
             font-family: monospace;
             background: #f8f9fa;
-            padding: 5px 10px;
-            border-radius: 4px;
-            font-size: 0.9em;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 0.85em;
+            color: #666;
+            word-break: break-all;
         }
-        .btn-rename {
-            padding: 2px 8px;
-            font-size: 0.8em;
+        
+        .size-info {
+            font-size: 0.85rem;
+            color: #6c757d;
+        }
+        
+        .btn {
+            border-radius: 6px;
+            padding: 0.5rem 1rem;
+        }
+        
+        .btn-sm {
+            padding: 0.25rem 0.5rem;
+        }
+        
+        .btn-primary {
+            background-color: var(--primary-color);
+            border-color: var(--primary-color);
+        }
+        
+        .btn-primary:hover {
+            background-color: var(--secondary-color);
+            border-color: var(--secondary-color);
+        }
+        
+        @media (max-width: 768px) {
+            .download-item {
+                padding: 15px;
+            }
+            
+            .filename {
+                font-size: 0.9rem;
+            }
+            
+            .custom-url {
+                font-size: 0.8em;
+            }
+            
+            .btn-sm {
+                padding: 0.2rem 0.4rem;
+            }
         }
     </style>
 </head>
@@ -164,20 +247,20 @@ HTML_TEMPLATE = """
         <div class="row">
             <div class="col-12">
                 <div class="card">
-                    <div class="card-header bg-white">
+                    <div class="card-header bg-white py-3">
                         <h5 class="mb-0"><i class="fas fa-download me-2"></i>New Download</h5>
                     </div>
                     <div class="card-body">
                         <form method="post" class="row g-3">
-                            <div class="col-md-8">
+                            <div class="col-md-8 col-sm-12">
                                 <input type="url" class="form-control" name="url" 
                                        placeholder="Enter download URL" required>
                             </div>
-                            <div class="col-md-2">
+                            <div class="col-md-2 col-sm-6">
                                 <input type="text" class="form-control" name="custom_url" 
                                        placeholder="Custom URL path">
                             </div>
-                            <div class="col-md-2">
+                            <div class="col-md-2 col-sm-6">
                                 <button type="submit" class="btn btn-primary w-100">
                                     <i class="fas fa-download me-2"></i>Download
                                 </button>
@@ -189,49 +272,51 @@ HTML_TEMPLATE = """
 
             <div class="col-12">
                 <div class="card">
-                    <div class="card-header bg-white">
+                    <div class="card-header bg-white py-3">
                         <h5 class="mb-0"><i class="fas fa-list me-2"></i>Downloads</h5>
                     </div>
                     <div class="card-body" id="downloads-list">
                         {% for filename, info in downloads.items() %}
                             <div class="download-item">
-                                <div class="d-flex justify-content-between align-items-center mb-2">
-                                    <h6 class="mb-0">{{ info.get('original_name', filename) }}</h6>
-                                    <div>
+                                <div class="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center mb-3">
+                                    <span class="filename">{{ info.get('original_name', filename) }}</span>
+                                    <div class="mt-2 mt-md-0">
                                         {% if info.status == 'completed' %}
-                                            <button class="btn btn-sm btn-outline-primary btn-rename me-2" 
+                                            <button class="btn btn-sm btn-outline-primary me-1" 
                                                     onclick="renameFile('{{ filename }}')">
                                                 <i class="fas fa-edit"></i>
                                             </button>
                                             <a href="{{ url_for('download_file', filename=filename) }}" 
-                                               class="btn btn-sm btn-success">
-                                                <i class="fas fa-download me-1"></i>Download
+                                               class="btn btn-sm btn-success me-1">
+                                                <i class="fas fa-download"></i>
                                             </a>
-                                            <button class="btn btn-sm btn-danger ms-2" 
+                                            <button class="btn btn-sm btn-danger" 
                                                     onclick="deleteFile('{{ filename }}')">
                                                 <i class="fas fa-trash"></i>
                                             </button>
                                         {% endif %}
                                     </div>
                                 </div>
+                                
                                 {% if info.status == 'completed' and filename in file_mappings %}
-                                    <div class="custom-url mb-2">
+                                    <div class="custom-url mb-3">
                                         {{ request.host_url }}download/{{ file_mappings[filename] }}
                                     </div>
                                 {% endif %}
+                                
                                 <div class="progress mb-2">
                                     <div class="progress-bar {% if info.status == 'downloading' %}progress-bar-striped progress-bar-animated{% endif %}"
                                          role="progressbar" 
                                          style="width: {{ info.progress if info.progress else 0 }}%">
                                     </div>
                                 </div>
+                                
                                 <div class="d-flex justify-content-between align-items-center">
-                                    <small class="text-muted">
-                                        {% if info.size %}
-                                            {{ (info.downloaded / 1024 / 1024)|round(2) }} MB / 
-                                            {{ (info.size / 1024 / 1024)|round(2) }} MB
+                                    <span class="size-info">
+                                        {% if info.formatted_downloaded %}
+                                            {{ info.formatted_downloaded }} / {{ info.formatted_size }}
                                         {% endif %}
-                                    </small>
+                                    </span>
                                     <span class="badge {% if info.status == 'completed' %}bg-success{% elif info.status == 'failed' %}bg-danger{% else %}bg-primary{% endif %}">
                                         {{ info.status|title }}
                                     </span>
@@ -326,7 +411,6 @@ def get_status():
 
 @app.route("/download/<path:filename>")
 def download_file(filename):
-    # Check if it's a custom URL
     for real_filename, custom_url in file_mappings.items():
         if custom_url == filename:
             return send_from_directory(UPLOAD_FOLDER, real_filename, as_attachment=True)
@@ -346,6 +430,7 @@ def rename_file(filename):
         # Update status and mappings
         if filename in downloads_status:
             downloads_status[secure_filename(new_name)] = downloads_status.pop(filename)
+            downloads_status[secure_filename(new_name)]['original_name'] = new_name
         if filename in file_mappings:
             file_mappings[secure_filename(new_name)] = file_mappings.pop(filename)
             
