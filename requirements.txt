@@ -1,4 +1,4 @@
-Flask
-pymongo
-werkzeug
+flask
 requests
+werkzeug
+humanize
