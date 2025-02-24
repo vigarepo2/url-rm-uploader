@@ -1,6 +1,5 @@
 flask
 requests
+psutil
 werkzeug
 humanize
-psutil
-gunicorn
