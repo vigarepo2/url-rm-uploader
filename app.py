@@ -14,7 +14,7 @@ import platform
 import time
 
 app = Flask(__name__)
-app.secret_key = "supersecretkey"
+app.secret_key = os.environ.get("SECRET_KEY", "supersecretkey")  # Use env var for security
 
 UPLOAD_FOLDER = "temp_downloads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -90,19 +90,16 @@ def estimate_time_remaining(total_size, downloaded, speed):
 
 def get_filename_from_url(url, response):
     try:
-        # Try Content-Disposition header
         if 'Content-Disposition' in response.headers:
             cd = response.headers['Content-Disposition']
             if 'filename=' in cd:
                 filename = re.findall('filename="?([^"]+)"?', cd)[0]
                 return urllib.parse.unquote(filename)
         
-        # Try URL path
         path = urllib.parse.unquote(urllib.parse.urlparse(url).path)
         if path and '/' in path:
             return path.split('/')[-1]
         
-        # Try URL query parameters
         query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
         if 'file' in query:
             return urllib.parse.unquote(query['file'][0])
@@ -526,7 +523,7 @@ def index():
         
         if url:
             try:
-                response = requests.head(url, allow_redirects=True)
+                response = requests.head(url, allow_redirects=True, timeout=10)
                 original_filename = get_filename_from_url(url, response) or f"download_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 save_filename = secure_filename(original_filename)
                 
@@ -550,7 +547,7 @@ def index():
                 flash("Download started!", "success")
                 
             except Exception as e:
-                flash(f"Error: {str(e)}", "danger")
+                flash(f"Error starting download: {str(e)}", "danger")
                 
         return redirect(url_for("index"))
     
@@ -609,4 +606,5 @@ def delete_file(filename):
         return jsonify({"status": "error", "message": str(e)})
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))  # Use Scalingo's PORT or default to 5000 locally
+    app.run(debug=False, host="0.0.0.0", port=port)  # Debug off for production
