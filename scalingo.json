@@ -1,0 +1,11 @@
+{
+  "buildpacks": [
+    {"url": "https://github.com/Scalingo/python-buildpack.git"}
+  ],
+  "containers": {
+    "web": {
+      "size": "M",
+      "amount": 1
+    }
+  }
+}
